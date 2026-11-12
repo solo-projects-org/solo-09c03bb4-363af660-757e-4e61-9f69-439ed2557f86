@@ -322,3 +322,144 @@ def test_bucket_count_cap():
     )
     assert resp.status_code == 400
     assert "上限" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------- 流式查询
+
+def test_query_streamed_bytes_match_response_model(imported):
+    """流式响应的字节必须与 QueryResponse 模型的序列化结果完全一致。"""
+    import json as jsonlib
+
+    params = {"start_ts": 1000, "end_ts": 1200, "bucket_width_ms": 100}
+    resp = client.get(f"/tests/{imported['id']}/query", params=params)
+    assert resp.status_code == 200
+    # 已知长度，照常给出 Content-Length，且与实际字节数一致
+    assert resp.headers["content-length"] == str(len(resp.content))
+
+    expected = {
+        "test_id": imported["id"],
+        "test_name": "unit-test-1",
+        "start_ts": 1000,
+        "end_ts": 1200,
+        "bucket_width_ms": 100,
+        "bucket_count": 2,
+        "missing_bucket_count": 0,
+        "metrics": {"blocks_used": 0, "blocks_by_level": {}, "raw_rows_read": 2},
+        "buckets": [
+            {
+                "bucket_index": 0,
+                "start_ts": 1000,
+                "end_ts": 1100,
+                "sample_count": 1,
+                "missing": False,
+                "points": [
+                    {"ts": 1000, "pressure": 10.0,
+                     "roles": ["first", "last", "max", "min"]}
+                ],
+            },
+            {
+                "bucket_index": 1,
+                "start_ts": 1100,
+                "end_ts": 1200,
+                "sample_count": 1,
+                "missing": False,
+                "points": [
+                    {"ts": 1100, "pressure": 12.0,
+                     "roles": ["first", "last", "max", "min"]}
+                ],
+            },
+        ],
+    }
+    expected_bytes = jsonlib.dumps(
+        expected, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert resp.content == expected_bytes
+
+
+def test_query_spool_rollover_keeps_bytes(imported, monkeypatch):
+    """缓冲落盘（内存阈值调小）后，响应字节必须与纯内存路径一致。"""
+    from app import config
+
+    params = {"start_ts": 800, "end_ts": 2000, "bucket_width_ms": 100}
+    baseline = client.get(f"/tests/{imported['id']}/query", params=params)
+    assert baseline.status_code == 200
+
+    monkeypatch.setattr(config, "STREAM_SPOOL_BYTES", 1)  # 强制滚动到临时文件
+    rolled = client.get(f"/tests/{imported['id']}/query", params=params)
+    assert rolled.status_code == 200
+    assert rolled.content == baseline.content
+
+
+@pytest.fixture(scope="module")
+def imported_dense():
+    # 5000 点、1ms 间隔：可产生 5000 个非空桶
+    rows = [(2_000_000 + i, 300.0 + (i % 7) * 0.5) for i in range(5000)]
+    resp = client.post(
+        "/tests/import",
+        data={"name": "dense-5000"},
+        files={"file": ("d.csv", _csv(rows), "text/csv")},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_many_nonempty_buckets_streamed(imported_dense, monkeypatch):
+    """数千个非空桶：响应完整、逐桶正确，且缓冲落盘不影响结果。"""
+    from app import config
+
+    monkeypatch.setattr(config, "MAX_BUCKETS", 10000)
+    monkeypatch.setattr(config, "STREAM_SPOOL_BYTES", 1024)  # 1 KiB，强制落盘
+    params = {"start_ts": 2_000_000, "end_ts": 2_005_000, "bucket_width_ms": 1}
+    resp = client.get(f"/tests/{imported_dense['id']}/query", params=params)
+    assert resp.status_code == 200
+    assert resp.headers["content-length"] == str(len(resp.content))
+    body = resp.json()
+    assert body["bucket_count"] == 5000
+    assert body["missing_bucket_count"] == 0
+    assert all(b["sample_count"] == 1 for b in body["buckets"])
+    # 单点桶四角色合一；首尾桶抽查
+    first = body["buckets"][0]
+    assert first["points"] == [
+        {"ts": 2_000_000, "pressure": 300.0,
+         "roles": ["first", "last", "max", "min"]}
+    ]
+    assert body["buckets"][-1]["points"][0]["ts"] == 2_004_999
+    # 1ms 桶切开 4 点块：每桶回读 1 行原始采样
+    assert body["metrics"]["raw_rows_read"] == 5000
+    assert body["metrics"]["blocks_used"] == 0
+
+
+def test_import_uses_batched_inserts(monkeypatch):
+    """导入分批写入：批次调小后结果不变。"""
+    from app import config
+
+    monkeypatch.setattr(config, "IMPORT_BATCH_SIZE", 3)
+    rows = [(9_000_000 + i * 50, float(i % 5)) for i in range(10)]
+    resp = client.post(
+        "/tests/import",
+        data={"name": "batched"},
+        files={"file": ("b.csv", _csv(rows), "text/csv")},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["sample_count"] == 10
+    q = client.get(
+        f"/tests/{body['id']}/query",
+        params={"start_ts": 9_000_000, "end_ts": 9_000_500, "bucket_width_ms": 500},
+    ).json()
+    assert q["buckets"][0]["sample_count"] == 10
+    assert q["buckets"][0]["points"][0]["ts"] == 9_000_000
+
+
+def test_import_invalid_csv_leaves_no_partial_data():
+    """校验失败整次回滚：试验数不变、库内不留半成品。"""
+    before = len(client.get("/tests").json())
+    bad = b"timestamp_ms,pressure_kpa\n1,10.0\n2,11.0\n2,12.0\n3,13.0\n"
+    resp = client.post(
+        "/tests/import",
+        data={"name": "should-fail"},
+        files={"file": ("bad.csv", bad, "text/csv")},
+    )
+    assert resp.status_code == 400
+    assert "严格递增" in resp.json()["detail"]
+    assert len(client.get("/tests").json()) == before

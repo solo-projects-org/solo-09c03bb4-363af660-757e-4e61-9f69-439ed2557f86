@@ -8,9 +8,16 @@ services:
     environment:
       PUMP_DB_PATH: /data/pump_tests.db
       PUMP_BLOCK_SIZE: "128"
+      PUMP_MAX_BUCKETS: "100000"
     volumes:
       - pump-data:/data
     restart: unless-stopped
+    # 容器内存上限 256 MiB：10 万桶查询在此上限内流式返回完整 JSON
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 256Mi
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
       interval: 15s

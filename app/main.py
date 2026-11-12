@@ -8,13 +8,14 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlite3 import Connection
 
 from . import config
 from .db import init_db, session
 from .ingest import CsvValidationError, import_test
 from .schemas import ImportResponse, QueryResponse, TestOut
-from .service import bucket_query
+from .service import prepare_query_stream
 
 
 @asynccontextmanager
@@ -116,8 +117,25 @@ def query_buckets(
             status_code=400, detail="end_ts 必须大于 start_ts（半开区间 [start, end)）"
         )
     try:
-        return bucket_query(conn, test_id, start_ts, end_ts, bucket_width_ms)
+        stream = prepare_query_stream(conn, test_id, start_ts, end_ts, bucket_width_ms)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    def iter_body():
+        # 只读缓冲文件，不再触碰数据库；桶多响应大时内存依然恒定
+        try:
+            yield stream.header
+            while chunk := stream.body.read(config.STREAM_CHUNK_BYTES):
+                yield chunk
+            yield stream.trailer
+        finally:
+            stream.body.close()
+
+    # 响应结构与 QueryResponse 相同；长度已知，照常给出 Content-Length
+    return StreamingResponse(
+        iter_body(),
+        media_type="application/json",
+        headers={"Content-Length": str(stream.content_length)},
+    )

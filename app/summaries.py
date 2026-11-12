@@ -105,17 +105,13 @@ def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> 
     """为已写入 samples 的试验构建全部摘要层级，返回最高 level。
 
     调用方负责事务管理；level 1 块直接按 rowid 序号分块聚合，
-    之后逐层合并子块，直到只剩一个块。
+    之后逐层合并子块，直到只剩一个块。原始采样按游标流式读取，
+    不在内存中堆积整张采样表，长记录导入也能在受限容器内完成。
     """
     cur = conn.execute(
         "SELECT rowid AS rid, ts, pressure FROM samples WHERE test_id = ? ORDER BY rowid",
         (test_id,),
     )
-    rows = cur.fetchall()
-    if not rows:
-        return 0
-
-    level_rows: list[tuple] = []  # (stats, first_rowid, last_rowid)
 
     def flush(level: int, entries: list[tuple]) -> None:
         for idx, (st, first_rid, last_rid) in enumerate(entries):
@@ -142,19 +138,28 @@ def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> 
                 ),
             )
 
-    # ---- level 1：原始采样分块 ----
+    # ---- level 1：原始采样分块（流式读取，逐块聚合）----
     entries: list[tuple] = []
     acc = Stats()
-    block_first_rid = rows[0]["rid"]
-    for i, row in enumerate(rows):
-        st = stats_from_sample(row["ts"], row["pressure"])
-        acc = merge_stats(acc, st)
-        if (i + 1) % block_size == 0:
-            entries.append((acc, block_first_rid, row["rid"]))
+    block_first_rid: Optional[int] = None
+    block_count = 0
+    last_rid: Optional[int] = None
+    for row in cur:
+        rid = row["rid"]
+        if block_first_rid is None:
+            block_first_rid = rid
+        acc = merge_stats(acc, stats_from_sample(row["ts"], row["pressure"]))
+        block_count += 1
+        last_rid = rid
+        if block_count == block_size:
+            entries.append((acc, block_first_rid, rid))
             acc = Stats()
-            block_first_rid = rows[i + 1]["rid"] if i + 1 < len(rows) else row["rid"]
+            block_first_rid = None
+            block_count = 0
     if acc.sample_count:
-        entries.append((acc, block_first_rid, rows[-1]["rid"]))
+        entries.append((acc, block_first_rid, last_rid))
+    if not entries:
+        return 0
     flush(1, entries)
     max_level = 1
 
@@ -176,6 +181,22 @@ def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> 
     return max_level
 
 
+def level_time_spans(conn: sqlite3.Connection, test_id: int) -> dict[int, int]:
+    """各级摘要块的最大时间跨度（end_ts - start_ts），按 level 返回。
+
+    用于给块检索的 start_ts 下界裁剪：与区间 [q_start, q_end) 相交的块
+    必满足 start_ts >= q_start - 该层最大跨度（否则 end_ts <= start_ts +
+    最大跨度 < q_start，不可能相交）。裁剪只缩小扫描范围，不改变结果集。
+    """
+    return dict(
+        conn.execute(
+            "SELECT level, MAX(end_ts - start_ts) FROM blocks "
+            "WHERE test_id = ? GROUP BY level",
+            (test_id,),
+        ).fetchall()
+    )
+
+
 def range_summary(
     conn: sqlite3.Connection,
     test_id: int,
@@ -184,6 +205,7 @@ def range_summary(
     max_level: int,
     block_size: int | None = None,
     metrics: Optional[dict] = None,
+    level_spans: Optional[dict] = None,
 ) -> Optional[Stats]:
     """计算半开区间 [q_start, q_end) 内采样的四点统计。
 
@@ -192,6 +214,10 @@ def range_summary(
     2. 块完整落在区间内 -> 直接采用块摘要（命中缓存，不读采样）；
     3. 块被区间边界切开 -> 降到下一层递归；到 level 1 仍被切开
        时，按 rowid 范围读取该块内的原始采样。
+
+    level_spans（level_time_spans 的结果）可选：提供后用每层最大块跨度
+    给 start_ts 加下界，避免每次检索都从该层首个块开始扫描（长记录 +
+    多桶查询时扫描量从 O(块数²) 降到 O(块数)），结果与统计不受影响。
     """
     block_size = block_size or config.BLOCK_SIZE
     if metrics is None:
@@ -204,13 +230,24 @@ def range_summary(
     overall = Stats()
 
     while level >= 1:
-        rows = conn.execute(
-            """SELECT * FROM blocks
-               WHERE test_id = ? AND level = ?
-                 AND start_ts < ? AND end_ts >= ?
-               ORDER BY block_index""",
-            (test_id, level, q_end, q_start),
-        ).fetchall()
+        # 相交块的 start_ts 下界：小于该值的块 end_ts 必然也 < q_start
+        span = level_spans.get(level) if level_spans else None
+        if span is not None:
+            rows = conn.execute(
+                """SELECT * FROM blocks
+                   WHERE test_id = ? AND level = ?
+                     AND start_ts < ? AND start_ts >= ? AND end_ts >= ?
+                   ORDER BY block_index""",
+                (test_id, level, q_end, q_start - span, q_start),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM blocks
+                   WHERE test_id = ? AND level = ?
+                     AND start_ts < ? AND end_ts >= ?
+                   ORDER BY block_index""",
+                (test_id, level, q_end, q_start),
+            ).fetchall()
 
         if not rows:
             # 本层没有相交块（例如查询区间只压在尾部半块之外），继续向下找
@@ -261,6 +298,7 @@ def range_summary(
                     level - 1,
                     block_size,
                     metrics,
+                    level_spans,
                 )
                 if sub is not None:
                     overall = merge_stats(overall, sub)

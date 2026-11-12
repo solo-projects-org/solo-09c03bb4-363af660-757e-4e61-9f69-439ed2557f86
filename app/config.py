@@ -15,6 +15,15 @@ MAX_UPLOAD_BYTES = int(os.getenv("PUMP_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)
 # 一次分桶查询允许的最大桶数，防止桶宽过小导致结果爆炸
 MAX_BUCKETS = int(os.getenv("PUMP_MAX_BUCKETS", "100000"))
 
+# 流式查询：桶 JSON 片段在内存中缓冲的字节上限，超出自动滚动到临时文件
+STREAM_SPOOL_BYTES = int(os.getenv("PUMP_STREAM_SPOOL_BYTES", str(8 * 1024 * 1024)))
+
+# 流式查询：回读缓冲文件发给客户端的块大小
+STREAM_CHUNK_BYTES = int(os.getenv("PUMP_STREAM_CHUNK_BYTES", str(64 * 1024)))
+
+# 导入时每批写入 SQLite 的采样行数（控制内存峰值）
+IMPORT_BATCH_SIZE = int(os.getenv("PUMP_IMPORT_BATCH_SIZE", "10000"))
+
 # 时间戳列 / 压力列允许的表头（小写比较，支持中文表头）
 TIMESTAMP_COLUMNS = (
     "timestamp",
